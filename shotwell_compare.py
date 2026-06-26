@@ -10,6 +10,8 @@ Reference (Shotwell source):
 
 import os
 import sys
+import re
+import json
 import tempfile
 import concurrent.futures
 import ctypes
@@ -76,6 +78,122 @@ RAW_EXTS = {
     ".rwz", ".x3f", ".srw",
 }
 DROP_EXTS = RAW_EXTS | {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+# metadata 侧车文件扩展名（拖入 RAW 调参区可自动填参）
+METADATA_EXTS = {".txt", ".json"}
+
+# ISP/算法侧 metadata 中 bayer_layout 编号 → DNGauge pattern 字符串
+# 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR（按上游约定，非字典序）
+BAYER_LAYOUT_MAP = {0: "RGGB", 1: "GRBG", 2: "GBRG", 3: "BGGR"}
+
+
+def _parse_float_list(text: str):
+    """从逗号/空格分隔的数字串中解析出 float 列表，失败返回 []。"""
+    nums = []
+    for tok in re.split(r"[,\s]+", (text or "").strip()):
+        if not tok:
+            continue
+        try:
+            nums.append(float(tok))
+        except ValueError:
+            pass
+    return nums
+
+
+def parse_metadata_file(path: str) -> Optional[dict]:
+    """解析 .txt / .json metadata 文件，提取 WB / BlackLevel / bayer_layout。
+
+    返回 dict：
+        wb: (r, g, b) 或 None
+        black: int（首值）或 None
+        black_all: tuple(int,...) 或 None（原始多通道值，用于提示）
+        bayer_layout: int 或 None
+    任一字段缺失为 None，不阻断其余；文件读取/解析失败整体返回 None。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return None
+
+    ext = os.path.splitext(path)[1].lower()
+    wb = None
+    black = None
+    black_all = None
+    bayer = None
+
+    if ext == ".json":
+        try:
+            obj = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        lower = {str(k).lower(): v for k, v in obj.items()}
+
+        def _num_list(key, cnt=None):
+            v = lower.get(key)
+            if v is None:
+                return []
+            if isinstance(v, (list, tuple)):
+                vals = list(v)
+            else:
+                vals = _parse_float_list(str(v))
+            out = []
+            for x in vals:
+                try:
+                    out.append(float(x))
+                except (TypeError, ValueError):
+                    pass
+            return out[:cnt] if cnt else out
+
+        wb_vals = _num_list("wbgain", 3)
+        if len(wb_vals) == 3:
+            wb = (wb_vals[0], wb_vals[1], wb_vals[2])
+        bl_vals = _num_list("blacklevel")
+        if bl_vals:
+            black_all = tuple(int(round(x)) for x in bl_vals)
+            black = black_all[0]
+        if "bayer_layout" in lower:
+            try:
+                bayer = int(lower["bayer_layout"])
+            except (TypeError, ValueError):
+                bayer = None
+    elif ext == ".txt":
+        # 多帧 dump：按行首 ID:N 切帧，取首帧；无 ID 行则整文件为首帧
+        lines = content.splitlines()
+        bounds = []
+        for i, line in enumerate(lines):
+            if re.match(r"\s*ID\s*:\s*\d+", line):
+                bounds.append(i)
+        if bounds:
+            first_block = "\n".join(lines[bounds[0]: (bounds[1] if len(bounds) > 1 else len(lines))])
+        else:
+            first_block = content
+
+        m = re.search(r"WbGain\s*:\s*([\d.,\s]+)", first_block)
+        if m:
+            vals = _parse_float_list(m.group(1))[:3]
+            if len(vals) == 3:
+                wb = (vals[0], vals[1], vals[2])
+
+        m = re.search(r"BlackLevel\s*:\s*([\d.,\s]+)", first_block)
+        if m:
+            vals = _parse_float_list(m.group(1))
+            if vals:
+                black_all = tuple(int(round(x)) for x in vals)
+                black = black_all[0]
+
+        m = re.search(r"bayer_layout\s*:\s*(\d+)", first_block)
+        if m:
+            bayer = int(m.group(1))
+    else:
+        return None
+
+    if wb is None and black is None and bayer is None:
+        return None
+    return {"wb": wb, "black": black, "black_all": black_all, "bayer_layout": bayer}
+
 
 
 def resource_path(name: str) -> str:
@@ -1409,8 +1527,42 @@ class AdjustPanel(QGroupBox):
         self.changed.emit(self.values())
 
 
+class _MetadataDropTab(QWidget):
+    """RawAdjustPanel 的单个 tab 页面，接受 .txt/.json metadata 文件拖拽。
+
+    仅对 metadata 扩展名 accept，其余 ignore 以便向父级冒泡（图像拖拽仍由主窗口处理）。
+    """
+
+    def __init__(self, pane_id: str, panel: "RawAdjustPanel", parent=None):
+        super().__init__(parent)
+        self._pane_id = pane_id
+        self._panel = panel
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if self._panel._is_metadata_drop(event):
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._panel._is_metadata_drop(event):
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        path = self._panel._first_local_file(event)
+        if path is None or not self._panel._is_metadata_drop(event):
+            event.ignore()
+            return
+        event.accept()
+        self._panel._apply_metadata_file(self._pane_id, path)
+
+
 class RawAdjustPanel(QGroupBox):
     changed = pyqtSignal(str, dict)  # pane_id, {channel, bit, black, white, exposure, wb_enabled, wb_r, wb_g, wb_b}
+    pattern_requested = pyqtSignal(str)  # bayer pattern (RGGB/GRBG/GBRG/BGGR) → 主窗口更新裸 RAW 配置
 
     def __init__(self, parent=None):
         super().__init__("RAW 调参", parent)
@@ -1443,7 +1595,7 @@ class RawAdjustPanel(QGroupBox):
         lay.addWidget(tabs)
 
     def _build_tab(self, pane_id: str) -> QWidget:
-        w = QWidget()
+        w = _MetadataDropTab(pane_id, self)
         lay = QVBoxLayout(w)
         hint = QLabel("")
         hint.setWordWrap(True)
@@ -1532,6 +1684,112 @@ class RawAdjustPanel(QGroupBox):
         if hint is not None:
             hint.setText(reason)
             hint.setVisible(bool(reason))
+
+    def _show_hint(self, pane_id: str, text: str) -> None:
+        """在指定 pane 的 hint 标签显示/清除提示（非阻塞）。"""
+        hint = self._hints.get(pane_id)
+        if hint is not None:
+            hint.setText(text)
+            hint.setVisible(bool(text))
+
+    @staticmethod
+    def _first_local_file(event) -> Optional[str]:
+        urls = event.mimeData().urls() if event.mimeData() else []
+        for url in urls:
+            if url.isLocalFile():
+                return url.toLocalFile()
+        return None
+
+    def _is_metadata_drop(self, event) -> bool:
+        md = event.mimeData() if event else None
+        if md is None or not md.hasUrls():
+            return False
+        for url in md.urls():
+            if url.isLocalFile() and os.path.splitext(url.toLocalFile())[1].lower() in METADATA_EXTS:
+                return True
+        return False
+
+    def _apply_metadata_file(self, pane_id: str, path: str) -> None:
+        """解析 metadata 文件并把字段应用到 pane（WB/Black）与全局 pattern。"""
+        data = parse_metadata_file(path)
+        name = os.path.basename(path)
+        if data is None:
+            self._show_hint(pane_id, f"metadata 解析失败：{name}")
+            return
+        wb = data.get("wb")
+        black_all = data.get("black_all")
+        black = data.get("black")
+        bayer = data.get("bayer_layout")
+        if wb is None and black is None and bayer is None:
+            self._show_hint(pane_id, f"未识别到 metadata 字段：{name}")
+            return
+
+        ws = self._widgets[pane_id]
+        # 保留其余控件当前值
+        channel = ws["channel"].currentText()
+        bit = int(ws["bit"].value())
+        white = int(ws["white"].value())
+        exposure = float(ws["exp"].value())
+        cur_black = int(ws["black"].value())
+        cur_wb_en = bool(ws["wb_en"].isChecked())
+        cur_wb = (
+            float(ws["wb_r"].value()),
+            float(ws["wb_g"].value()),
+            float(ws["wb_b"].value()),
+        )
+
+        # WB
+        if wb is not None:
+            wb_r = max(0.1, min(8.0, float(wb[0])))
+            wb_g = max(0.1, min(8.0, float(wb[1])))
+            wb_b = max(0.1, min(8.0, float(wb[2])))
+            wb_enabled = True
+        else:
+            wb_r, wb_g, wb_b = cur_wb
+            wb_enabled = cur_wb_en
+
+        # Black Level（单值控件）
+        hints = []
+        if black_all is not None and len(black_all) > 0:
+            first = int(black_all[0])
+            new_black = int(max(0, min(65535, first)))
+            if len(set(int(c) for c in black_all)) > 1:
+                hints.append(
+                    f"BlackLevel 四通道不等，已取首值 {first}"
+                    f"（实际：{','.join(str(int(c)) for c in black_all)}）"
+                )
+        elif black is not None:
+            new_black = int(max(0, min(65535, int(black))))
+        else:
+            new_black = cur_black
+
+        # 一次性写入：阻塞中间信号，赋值后手动发一次 changed，避免多次重渲染抖动
+        for w in ws.values():
+            w.blockSignals(True)
+        try:
+            ws["channel"].setCurrentText(channel)
+            ws["bit"].setValue(int(bit))
+            ws["black"].setValue(int(max(0, min(65535, int(new_black)))))
+            ws["white"].setValue(int(max(1, min(65535, int(white)))))
+            ws["exp"].setValue(float(exposure))
+            ws["wb_en"].setChecked(bool(wb_enabled))
+            ws["wb_r"].setValue(float(wb_r))
+            ws["wb_g"].setValue(float(wb_g))
+            ws["wb_b"].setValue(float(wb_b))
+        finally:
+            for w in ws.values():
+                w.blockSignals(False)
+        self._emit(pane_id)
+
+        # bayer_layout → 全局裸 RAW pattern
+        if bayer is not None:
+            pat = BAYER_LAYOUT_MAP.get(int(bayer))
+            if pat is not None:
+                self.pattern_requested.emit(pat)
+            else:
+                hints.append(f"bayer_layout 越界：{bayer}（应为 0-3）")
+
+        self._show_hint(pane_id, "；".join(hints) if hints else f"已应用 metadata：{name}")
 
 
 class RawLoadConfigDialog(QDialog):
@@ -1646,6 +1904,7 @@ class Window(QMainWindow):
         self._plain_raw_cfg_text = "4096,3072,10,RGGB,u16"
         self.raw_adj_panel = RawAdjustPanel(self)
         self.raw_adj_panel.changed.connect(self._on_raw_adjust_changed)
+        self.raw_adj_panel.pattern_requested.connect(self.set_plain_raw_pattern)
 
         self.btn_l.clicked.connect(lambda: self._load_one(self.left))
         self.btn_r.clicked.connect(lambda: self._load_one(self.right))
@@ -2113,6 +2372,21 @@ class Window(QMainWindow):
         except Exception:
             self.msg.setText("RAW 配置解析失败")
             return None
+
+    def set_plain_raw_pattern(self, pattern: str) -> None:
+        """用 metadata 的 bayer_layout 更新裸 RAW 加载配置的 pattern 段（第 4 段）。
+
+        格式 "width,height,bit,pattern,packing"；段数 ≥4 时替换 index 3，否则不动。
+        """
+        pat = str(pattern).upper()
+        if pat not in {"RGGB", "BGGR", "GRBG", "GBRG"}:
+            return
+        parts = self._plain_raw_cfg_text.split(",")
+        if len(parts) < 4:
+            return
+        parts[3] = pat
+        self._plain_raw_cfg_text = ",".join(parts)
+        self.msg.setText(f"裸 RAW pattern 已设为 {pat}")
 
     def _raw_can_use_shotwell_pipeline(self, path: str) -> bool:
         """判断 .RAW 是否可被 rawpy/libraw 直接识别（可走 Shotwell-like 管线）。"""

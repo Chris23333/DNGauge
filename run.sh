@@ -7,8 +7,11 @@ set -euo pipefail
 #   ./run.sh left.dng right.dng
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONDA_BASE="/home/wenjingxun/app/miniconda3"
+
 CONDA_ENV="dng_compare"
+
+# 自动获取当前机器的 conda 安装路径
+CONDA_BASE="$(conda info --base)"
 ENV_LIB="${CONDA_BASE}/envs/${CONDA_ENV}/lib"
 
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
